@@ -1,0 +1,568 @@
+/*
+ * uds_diag.can
+ * CAPL Automation Framework — UDS Diagnostics (ISO 14229-1)
+ *
+ * Provides helper functions for the most common UDS services:
+ *
+ *   SID 0x10 — Diagnostic Session Control
+ *   SID 0x11 — ECU Reset
+ *   SID 0x14 — Clear Diagnostic Information
+ *   SID 0x19 — Read DTC Information
+ *   SID 0x22 — Read Data By Identifier
+ *   SID 0x27 — Security Access (seed/key exchange)
+ *   SID 0x2E — Write Data By Identifier
+ *   SID 0x31 — Routine Control
+ *   SID 0x3E — Tester Present
+ *
+ * Usage:
+ *   includes { #include "../../lib/UDS/uds_diag.can" }
+ *
+ *   Set gUDS_TxId, gUDS_RxId, gUDS_Channel before sending requests.
+ *   Call uds_sendRequest() and then wait for uds_responseReceived() to
+ *   become 1, or use uds_waitForResponse() in a blocking test panel.
+ */
+
+includes
+{
+  #include "../CANTP/can_tp.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Constants — UDS Service Identifiers
+ *----------------------------------------------------------------------------*/
+#define UDS_SID_SESSION_CTRL   0x10
+#define UDS_SID_ECU_RESET      0x11
+#define UDS_SID_CLEAR_DTC      0x14
+#define UDS_SID_READ_DTC       0x19
+#define UDS_SID_READ_BY_ID     0x22
+#define UDS_SID_SECURITY_ACC   0x27
+#define UDS_SID_WRITE_BY_ID    0x2E
+#define UDS_SID_ROUTINE_CTRL   0x31
+#define UDS_SID_REQ_DOWNLOAD   0x34
+#define UDS_SID_TRANSFER_DATA  0x36
+#define UDS_SID_REQ_XFER_EXIT  0x37
+#define UDS_SID_TESTER_PRESENT 0x3E
+
+/* Diagnostic Session sub-functions */
+#define UDS_SESSION_DEFAULT    0x01
+#define UDS_SESSION_EXTENDED   0x03
+#define UDS_SESSION_PROGRAM    0x02
+
+/* ECU Reset sub-functions */
+#define UDS_RESET_HARD         0x01
+#define UDS_RESET_KEY_OFF_ON   0x02
+#define UDS_RESET_SOFT         0x03
+
+/* Routine Control sub-functions */
+#define UDS_ROUTINE_START      0x01
+#define UDS_ROUTINE_STOP       0x02
+#define UDS_ROUTINE_RESULT     0x03
+
+/* Response timeout (ms) */
+#define UDS_RESPONSE_TIMEOUT   2000
+
+/* Tester Present suppression bit */
+#define UDS_SUPPRESS_POS_RESP  0x80
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  /* Addressing */
+  long gUDS_TxId    = 0x7E0;   /* CAN ID for requests  */
+  long gUDS_RxId    = 0x7E8;   /* CAN ID for responses */
+  int  gUDS_Channel = 1;       /* CAN channel          */
+
+  /* Request / response buffers */
+  byte gUDS_ReqBuf[UDS_BUFFER_SIZE];
+  int  gUDS_ReqLen = 0;
+
+  byte gUDS_RespBuf[UDS_BUFFER_SIZE];
+  int  gUDS_RespLen = 0;
+
+  /* Status flags */
+  int  gUDS_ResponseReceived = 0;   /* Set to 1 when a valid response arrives */
+  int  gUDS_LastResult       = RESULT_OK;
+
+  /* Tester Present auto-send timer (ms, 0 = disabled) */
+  int  gUDS_TesterPresentInterval = 0;
+  msTimer gUDS_TpTimer;
+
+  /* Response timeout timer */
+  msTimer gUDS_RespTimer;
+}
+
+/*----------------------------------------------------------------------------
+ * uds_reset
+ *
+ * Clear request/response state.
+ *----------------------------------------------------------------------------*/
+void uds_reset(void)
+{
+  cancelTimer(gUDS_RespTimer);
+  gUDS_ResponseReceived = 0;
+  gUDS_LastResult       = RESULT_OK;
+  gUDS_ReqLen           = 0;
+  gUDS_RespLen          = 0;
+  canTP_reset();
+}
+
+/*----------------------------------------------------------------------------
+ * uds_sendRequest
+ *
+ * Send a UDS request through the CAN TP layer.
+ *
+ * Parameters:
+ *   data   — UDS payload (SID + sub-function / parameters)
+ *   length — payload length
+ *
+ * Returns RESULT_OK or an error code.
+ *----------------------------------------------------------------------------*/
+int uds_sendRequest(byte data[], int length)
+{
+  char logMsg[128];
+  char hexStr[64];
+  int  result;
+
+  if (length <= 0 || length > UDS_BUFFER_SIZE)
+  {
+    logMessage(LOG_ERROR, "UDS", "Invalid request length");
+    return RESULT_INVALID_PARAM;
+  }
+
+  memcpy(gUDS_ReqBuf, data, length);
+  gUDS_ReqLen           = length;
+  gUDS_ResponseReceived = 0;
+  gUDS_RespLen          = 0;
+
+  bytesToHexString(data, length, hexStr, elcount(hexStr));
+  snprintf(logMsg, elcount(logMsg), "REQ [%s]", hexStr);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  result = canTP_sendRequest(gUDS_TxId, gUDS_RxId, data, length, gUDS_Channel);
+  if (result == RESULT_OK)
+    setTimer(gUDS_RespTimer, UDS_RESPONSE_TIMEOUT);
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * uds_processResponse
+ *
+ * Parse a received CAN TP payload as a UDS response.
+ * Call this once canTP_getResponse() returns successfully.
+ *
+ * Returns RESULT_OK, RESULT_NEGATIVE_RESP, or RESULT_SEQUENCE_ERROR.
+ *----------------------------------------------------------------------------*/
+int uds_processResponse(byte respData[], int respLen)
+{
+  byte nrc;
+  char logMsg[128];
+  char hexStr[256];
+  char nrcStr[64];
+
+  if (respLen < 1)
+  {
+    logMessage(LOG_ERROR, "UDS", "Empty response");
+    gUDS_LastResult = RESULT_SEQUENCE_ERROR;
+    return RESULT_SEQUENCE_ERROR;
+  }
+
+  bytesToHexString(respData, respLen, hexStr, elcount(hexStr));
+  snprintf(logMsg, elcount(logMsg), "RESP [%s]", hexStr);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  /* Check for Negative Response (0x7F SID NRC) */
+  if (isNegativeResponse(respData[0]))
+  {
+    if (respLen >= 3)
+    {
+      nrc = respData[2];
+
+      /* Response Pending (0x78) is not an error — continue waiting */
+      if (nrc == 0x78)
+      {
+        logMessage(LOG_DEBUG, "UDS",
+                   "NRC 0x78 requestCorrectlyReceivedResponsePending — waiting");
+        cancelTimer(gUDS_RespTimer);
+        setTimer(gUDS_RespTimer, UDS_RESPONSE_TIMEOUT);
+        return RESULT_OK;
+      }
+
+      nrcToString(nrc, nrcStr, elcount(nrcStr));
+      snprintf(logMsg, elcount(logMsg),
+               "Negative Response: SID=0x%02X NRC=0x%02X (%s)",
+               respData[1], nrc, nrcStr);
+      logMessage(LOG_ERROR, "UDS", logMsg);
+    }
+    else
+    {
+      logMessage(LOG_ERROR, "UDS", "Malformed negative response (too short)");
+    }
+
+    memcpy(gUDS_RespBuf, respData, respLen);
+    gUDS_RespLen          = respLen;
+    gUDS_ResponseReceived = 1;
+    gUDS_LastResult       = RESULT_NEGATIVE_RESP;
+    cancelTimer(gUDS_RespTimer);
+    return RESULT_NEGATIVE_RESP;
+  }
+
+  /* Positive response */
+  memcpy(gUDS_RespBuf, respData, respLen);
+  gUDS_RespLen          = respLen;
+  gUDS_ResponseReceived = 1;
+  gUDS_LastResult       = RESULT_OK;
+  cancelTimer(gUDS_RespTimer);
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * uds_waitForResponse
+ *
+ * Blocking poll for a UDS response.  Call after uds_sendRequest().
+ * Times out after UDS_RESPONSE_TIMEOUT milliseconds.
+ *
+ * Returns RESULT_OK on positive response, RESULT_TIMEOUT, or
+ * RESULT_NEGATIVE_RESP.
+ *----------------------------------------------------------------------------*/
+int uds_waitForResponse(void)
+{
+  long startTime;
+  long elapsed;
+
+  startTime = timeNow() / 100000;   /* Convert 100-ns ticks to ms */
+
+  while (gUDS_ResponseReceived == 0)
+  {
+    elapsed = (timeNow() / 100000) - startTime;
+    if (elapsed >= UDS_RESPONSE_TIMEOUT)
+    {
+      logMessage(LOG_ERROR, "UDS", "Response timeout");
+      gUDS_LastResult = RESULT_TIMEOUT;
+      return RESULT_TIMEOUT;
+    }
+  }
+
+  return gUDS_LastResult;
+}
+
+/*============================================================================
+ * Service helper functions
+ *============================================================================*/
+
+/*----------------------------------------------------------------------------
+ * uds_sessionControl
+ *
+ * SID 0x10 — Diagnostic Session Control
+ *
+ * Parameters:
+ *   subFunc — UDS_SESSION_DEFAULT / UDS_SESSION_EXTENDED / UDS_SESSION_PROGRAM
+ *----------------------------------------------------------------------------*/
+int uds_sessionControl(byte subFunc)
+{
+  byte req[2];
+  char logMsg[64];
+
+  req[0] = UDS_SID_SESSION_CTRL;
+  req[1] = subFunc;
+
+  snprintf(logMsg, elcount(logMsg), "SessionControl sub=0x%02X", subFunc);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 2);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_ecuReset
+ *
+ * SID 0x11 — ECU Reset
+ *
+ * Parameters:
+ *   resetType — UDS_RESET_HARD / UDS_RESET_KEY_OFF_ON / UDS_RESET_SOFT
+ *----------------------------------------------------------------------------*/
+int uds_ecuReset(byte resetType)
+{
+  byte req[2];
+  char logMsg[64];
+
+  req[0] = UDS_SID_ECU_RESET;
+  req[1] = resetType;
+
+  snprintf(logMsg, elcount(logMsg), "ECUReset type=0x%02X", resetType);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 2);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_clearDTC
+ *
+ * SID 0x14 — Clear Diagnostic Information
+ *
+ * Parameters:
+ *   groupOfDTC — 3-byte DTC group; 0xFFFFFF clears all DTCs
+ *----------------------------------------------------------------------------*/
+int uds_clearDTC(long groupOfDTC)
+{
+  byte req[4];
+
+  req[0] = UDS_SID_CLEAR_DTC;
+  req[1] = (byte)((groupOfDTC >> 16) & 0xFF);
+  req[2] = (byte)((groupOfDTC >>  8) & 0xFF);
+  req[3] = (byte)( groupOfDTC        & 0xFF);
+
+  logMessage(LOG_INFO, "UDS", "ClearDTC groupOfDTC=0xFFFFFF");
+
+  return uds_sendRequest(req, 4);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_readDTCByStatusMask
+ *
+ * SID 0x19 sub 0x02 — Report DTCs by status mask
+ *
+ * Parameters:
+ *   statusMask — 1-byte status mask (e.g. 0x09 = confirmed + pending)
+ *----------------------------------------------------------------------------*/
+int uds_readDTCByStatusMask(byte statusMask)
+{
+  byte req[3];
+  char logMsg[64];
+
+  req[0] = UDS_SID_READ_DTC;
+  req[1] = 0x02;           /* reportDTCByStatusMask */
+  req[2] = statusMask;
+
+  snprintf(logMsg, elcount(logMsg), "ReadDTC mask=0x%02X", statusMask);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 3);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_readDataByIdentifier
+ *
+ * SID 0x22 — Read Data By Identifier
+ *
+ * Parameters:
+ *   dataId — 2-byte data identifier (DIDS)
+ *----------------------------------------------------------------------------*/
+int uds_readDataByIdentifier(word dataId)
+{
+  byte req[3];
+  char logMsg[64];
+
+  req[0] = UDS_SID_READ_BY_ID;
+  req[1] = (byte)((dataId >> 8) & 0xFF);
+  req[2] = (byte)( dataId       & 0xFF);
+
+  snprintf(logMsg, elcount(logMsg), "ReadDataByID DID=0x%04X", dataId);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 3);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_securityAccessRequestSeed
+ *
+ * SID 0x27 — Security Access: request seed (odd sub-function)
+ *
+ * Parameters:
+ *   level — security level (e.g. 0x01, 0x03, 0x05 …)
+ *----------------------------------------------------------------------------*/
+int uds_securityAccessRequestSeed(byte level)
+{
+  byte req[2];
+  char logMsg[64];
+
+  req[0] = UDS_SID_SECURITY_ACC;
+  req[1] = level | 0x01;   /* Odd sub-function = request seed */
+
+  snprintf(logMsg, elcount(logMsg), "SecurityAccess RequestSeed level=0x%02X", req[1]);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 2);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_securityAccessSendKey
+ *
+ * SID 0x27 — Security Access: send computed key (even sub-function)
+ *
+ * Parameters:
+ *   level  — security level (will be made even automatically)
+ *   key    — computed key bytes
+ *   keyLen — length of key in bytes
+ *----------------------------------------------------------------------------*/
+int uds_securityAccessSendKey(byte level, byte key[], int keyLen)
+{
+  byte req[UDS_BUFFER_SIZE];
+  int  i;
+  char logMsg[64];
+
+  if (keyLen <= 0 || keyLen > UDS_BUFFER_SIZE - 2)
+  {
+    logMessage(LOG_ERROR, "UDS", "Invalid key length");
+    return RESULT_INVALID_PARAM;
+  }
+
+  req[0] = UDS_SID_SECURITY_ACC;
+  req[1] = (level % 2 == 0) ? level : level + 1;  /* Even sub-function */
+
+  for (i = 0; i < keyLen; i++)
+    req[2 + i] = key[i];
+
+  snprintf(logMsg, elcount(logMsg), "SecurityAccess SendKey level=0x%02X len=%d",
+           req[1], keyLen);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 2 + keyLen);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_writeDataByIdentifier
+ *
+ * SID 0x2E — Write Data By Identifier
+ *
+ * Parameters:
+ *   dataId  — 2-byte identifier
+ *   data    — data bytes to write
+ *   dataLen — number of data bytes
+ *----------------------------------------------------------------------------*/
+int uds_writeDataByIdentifier(word dataId, byte data[], int dataLen)
+{
+  byte req[UDS_BUFFER_SIZE];
+  int  i;
+  char logMsg[64];
+
+  if (dataLen <= 0 || dataLen > UDS_BUFFER_SIZE - 3)
+  {
+    logMessage(LOG_ERROR, "UDS", "WriteDataByID: invalid data length");
+    return RESULT_INVALID_PARAM;
+  }
+
+  req[0] = UDS_SID_WRITE_BY_ID;
+  req[1] = (byte)((dataId >> 8) & 0xFF);
+  req[2] = (byte)( dataId       & 0xFF);
+  for (i = 0; i < dataLen; i++)
+    req[3 + i] = data[i];
+
+  snprintf(logMsg, elcount(logMsg), "WriteDataByID DID=0x%04X len=%d", dataId, dataLen);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 3 + dataLen);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_routineControl
+ *
+ * SID 0x31 — Routine Control
+ *
+ * Parameters:
+ *   subFunc   — UDS_ROUTINE_START / _STOP / _RESULT
+ *   routineId — 2-byte routine identifier
+ *   params    — optional parameter bytes (may be NULL for 0 bytes)
+ *   paramLen  — length of params (0 if none)
+ *----------------------------------------------------------------------------*/
+int uds_routineControl(byte subFunc, word routineId, byte params[], int paramLen)
+{
+  byte req[UDS_BUFFER_SIZE];
+  int  i;
+  char logMsg[96];
+
+  if (paramLen < 0 || paramLen > UDS_BUFFER_SIZE - 4)
+  {
+    logMessage(LOG_ERROR, "UDS", "RoutineControl: invalid param length");
+    return RESULT_INVALID_PARAM;
+  }
+
+  req[0] = UDS_SID_ROUTINE_CTRL;
+  req[1] = subFunc;
+  req[2] = (byte)((routineId >> 8) & 0xFF);
+  req[3] = (byte)( routineId       & 0xFF);
+  for (i = 0; i < paramLen; i++)
+    req[4 + i] = params[i];
+
+  snprintf(logMsg, elcount(logMsg),
+           "RoutineControl sub=0x%02X routineId=0x%04X paramLen=%d",
+           subFunc, routineId, paramLen);
+  logMessage(LOG_INFO, "UDS", logMsg);
+
+  return uds_sendRequest(req, 4 + paramLen);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_testerPresent
+ *
+ * SID 0x3E — Tester Present
+ *
+ * Parameters:
+ *   suppressPositiveResponse — set to 1 to suppress the response (0x80 flag)
+ *----------------------------------------------------------------------------*/
+int uds_testerPresent(int suppressPositiveResponse)
+{
+  byte req[2];
+
+  req[0] = UDS_SID_TESTER_PRESENT;
+  req[1] = suppressPositiveResponse ? UDS_SUPPRESS_POS_RESP : 0x00;
+
+  logMessage(LOG_DEBUG, "UDS", "TesterPresent");
+
+  return uds_sendRequest(req, 2);
+}
+
+/*----------------------------------------------------------------------------
+ * uds_startTesterPresent
+ *
+ * Start periodic Tester Present messages at the given interval.
+ *
+ * Parameters:
+ *   intervalMs — period in milliseconds (0 to disable)
+ *----------------------------------------------------------------------------*/
+void uds_startTesterPresent(int intervalMs)
+{
+  char logMsg[64];
+
+  if (intervalMs <= 0)
+  {
+    cancelTimer(gUDS_TpTimer);
+    gUDS_TesterPresentInterval = 0;
+    logMessage(LOG_INFO, "UDS", "TesterPresent periodic timer disabled");
+    return;
+  }
+
+  gUDS_TesterPresentInterval = intervalMs;
+  setTimer(gUDS_TpTimer, intervalMs);
+
+  snprintf(logMsg, elcount(logMsg),
+           "TesterPresent periodic timer started (%d ms)", intervalMs);
+  logMessage(LOG_INFO, "UDS", logMsg);
+}
+
+/*----------------------------------------------------------------------------
+ * on timer gUDS_TpTimer
+ *
+ * Periodic Tester Present sender.
+ *----------------------------------------------------------------------------*/
+on timer gUDS_TpTimer
+{
+  if (gUDS_TesterPresentInterval > 0)
+  {
+    uds_testerPresent(1);  /* Suppress positive response */
+    setTimer(gUDS_TpTimer, gUDS_TesterPresentInterval);
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * on timer gUDS_RespTimer
+ *
+ * UDS response timeout handler.
+ *----------------------------------------------------------------------------*/
+on timer gUDS_RespTimer
+{
+  logMessage(LOG_ERROR, "UDS", "Response timeout — no response received");
+  gUDS_LastResult       = RESULT_TIMEOUT;
+  gUDS_ResponseReceived = 1;   /* Unblock waitForResponse */
+}

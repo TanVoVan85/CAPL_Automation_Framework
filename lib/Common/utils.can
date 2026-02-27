@@ -1,0 +1,224 @@
+/*
+ * utils.can
+ * CAPL Automation Framework — Common Utilities
+ *
+ * Provides shared logging, error handling, and helper functions
+ * used across CAN TP, UDS Diagnostics, and Flash libraries.
+ *
+ * Usage: include this file in your CAPL node via:
+ *   includes { #include "../../lib/Common/utils.can" }
+ */
+
+/*----------------------------------------------------------------------------
+ * Constants
+ *----------------------------------------------------------------------------*/
+/* Log severity levels */
+#define LOG_DEBUG   0
+#define LOG_INFO    1
+#define LOG_WARN    2
+#define LOG_ERROR   3
+
+/* Result codes returned by framework functions */
+#define RESULT_OK               0x00
+#define RESULT_TIMEOUT          0x01
+#define RESULT_NEGATIVE_RESP    0x02
+#define RESULT_INVALID_PARAM    0x03
+#define RESULT_BUFFER_OVERFLOW  0x04
+#define RESULT_SEQUENCE_ERROR   0x05
+#define RESULT_CHECKSUM_ERROR   0x06
+#define RESULT_UNKNOWN_ERROR    0xFF
+
+/* Maximum payload size for a CAN frame */
+#define CAN_MAX_DLC             8
+
+/* Maximum UDS request / response buffer size */
+#define UDS_BUFFER_SIZE         4096
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  /* Current minimum log level — change to suppress lower-priority messages */
+  int gLogLevel = LOG_INFO;
+
+  /* Framework version string */
+  char gFrameworkVersion[16] = "1.0.0";
+}
+
+/*----------------------------------------------------------------------------
+ * logMessage
+ *
+ * Write a formatted log entry to the CANoe Write window.
+ *
+ * Parameters:
+ *   level   — one of LOG_DEBUG / LOG_INFO / LOG_WARN / LOG_ERROR
+ *   context — short context tag, e.g. "CANTP", "UDS", "FLASH"
+ *   msg     — human-readable message text
+ *----------------------------------------------------------------------------*/
+void logMessage(int level, char context[], char msg[])
+{
+  char prefix[16];
+
+  if (level < gLogLevel)
+    return;
+
+  switch (level)
+  {
+    case LOG_DEBUG: snprintf(prefix, elcount(prefix), "[DBG]"); break;
+    case LOG_INFO:  snprintf(prefix, elcount(prefix), "[INF]"); break;
+    case LOG_WARN:  snprintf(prefix, elcount(prefix), "[WRN]"); break;
+    case LOG_ERROR: snprintf(prefix, elcount(prefix), "[ERR]"); break;
+    default:        snprintf(prefix, elcount(prefix), "[???]"); break;
+  }
+
+  write("%s [%s] %s", prefix, context, msg);
+}
+
+/*----------------------------------------------------------------------------
+ * logMessageWithCode
+ *
+ * Like logMessage but appends a numeric code (e.g. NRC or error code).
+ *----------------------------------------------------------------------------*/
+void logMessageWithCode(int level, char context[], char msg[], long code)
+{
+  char fullMsg[256];
+  snprintf(fullMsg, elcount(fullMsg), "%s (code=0x%02X)", msg, code);
+  logMessage(level, context, fullMsg);
+}
+
+/*----------------------------------------------------------------------------
+ * resultToString
+ *
+ * Convert a RESULT_* code to a human-readable string.
+ *----------------------------------------------------------------------------*/
+void resultToString(int result, char outStr[], int outLen)
+{
+  switch (result)
+  {
+    case RESULT_OK:              snprintf(outStr, outLen, "OK");              break;
+    case RESULT_TIMEOUT:         snprintf(outStr, outLen, "TIMEOUT");         break;
+    case RESULT_NEGATIVE_RESP:   snprintf(outStr, outLen, "NEGATIVE_RESP");   break;
+    case RESULT_INVALID_PARAM:   snprintf(outStr, outLen, "INVALID_PARAM");   break;
+    case RESULT_BUFFER_OVERFLOW: snprintf(outStr, outLen, "BUFFER_OVERFLOW"); break;
+    case RESULT_SEQUENCE_ERROR:  snprintf(outStr, outLen, "SEQUENCE_ERROR");  break;
+    case RESULT_CHECKSUM_ERROR:  snprintf(outStr, outLen, "CHECKSUM_ERROR");  break;
+    default:                     snprintf(outStr, outLen, "UNKNOWN_ERROR");   break;
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * bytesToHexString
+ *
+ * Convert a byte array to a printable hex string.
+ * outStr must be at least (length * 3 + 1) bytes long.
+ *----------------------------------------------------------------------------*/
+void bytesToHexString(byte data[], int length, char outStr[], int outLen)
+{
+  int  i;
+  int  pos = 0;
+  char tmp[4];
+
+  outStr[0] = '\0';
+  for (i = 0; i < length && pos + 3 < outLen; i++)
+  {
+    snprintf(tmp, elcount(tmp), "%02X ", data[i]);
+    strncat(outStr, tmp, outLen - pos - 1);
+    pos += 3;
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * calculateChecksum
+ *
+ * Simple XOR checksum over a byte array.
+ * Returns the XOR of all bytes in data[0..length-1].
+ *----------------------------------------------------------------------------*/
+byte calculateChecksum(byte data[], int length)
+{
+  int  i;
+  byte crc = 0x00;
+
+  for (i = 0; i < length; i++)
+    crc ^= data[i];
+
+  return crc;
+}
+
+/*----------------------------------------------------------------------------
+ * validateBufferLength
+ *
+ * Check that 'required' bytes fit inside a buffer of 'available' bytes.
+ * Logs an error and returns RESULT_BUFFER_OVERFLOW when the check fails.
+ *----------------------------------------------------------------------------*/
+int validateBufferLength(int available, int required, char context[])
+{
+  char msg[128];
+
+  if (required > available)
+  {
+    snprintf(msg, elcount(msg),
+             "Buffer overflow: need %d bytes but only %d available",
+             required, available);
+    logMessage(LOG_ERROR, context, msg);
+    return RESULT_BUFFER_OVERFLOW;
+  }
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * isPositiveResponse
+ *
+ * Return 1 (true) when the first byte of a UDS response is a positive
+ * response SID (i.e. requestSID | 0x40), 0 otherwise.
+ *----------------------------------------------------------------------------*/
+int isPositiveResponse(byte responseSID, byte requestSID)
+{
+  return (responseSID == (requestSID | 0x40)) ? 1 : 0;
+}
+
+/*----------------------------------------------------------------------------
+ * isNegativeResponse
+ *
+ * Return 1 (true) when the response byte indicates a UDS negative response
+ * (0x7F), 0 otherwise.
+ *----------------------------------------------------------------------------*/
+int isNegativeResponse(byte responseByte)
+{
+  return (responseByte == 0x7F) ? 1 : 0;
+}
+
+/*----------------------------------------------------------------------------
+ * nrcToString
+ *
+ * Convert a UDS Negative Response Code (NRC) to a human-readable string.
+ *----------------------------------------------------------------------------*/
+void nrcToString(byte nrc, char outStr[], int outLen)
+{
+  switch (nrc)
+  {
+    case 0x10: snprintf(outStr, outLen, "generalReject");                        break;
+    case 0x11: snprintf(outStr, outLen, "serviceNotSupported");                  break;
+    case 0x12: snprintf(outStr, outLen, "subFunctionNotSupported");              break;
+    case 0x13: snprintf(outStr, outLen, "incorrectMessageLengthOrFormat");       break;
+    case 0x14: snprintf(outStr, outLen, "responseTooLong");                      break;
+    case 0x21: snprintf(outStr, outLen, "busyRepeatRequest");                    break;
+    case 0x22: snprintf(outStr, outLen, "conditionsNotCorrect");                 break;
+    case 0x24: snprintf(outStr, outLen, "requestSequenceError");                 break;
+    case 0x25: snprintf(outStr, outLen, "noResponseFromSubnetComponent");        break;
+    case 0x26: snprintf(outStr, outLen, "failurePreventsExecutionOfRequestedAction"); break;
+    case 0x31: snprintf(outStr, outLen, "requestOutOfRange");                    break;
+    case 0x33: snprintf(outStr, outLen, "securityAccessDenied");                 break;
+    case 0x35: snprintf(outStr, outLen, "invalidKey");                           break;
+    case 0x36: snprintf(outStr, outLen, "exceededNumberOfAttempts");             break;
+    case 0x37: snprintf(outStr, outLen, "requiredTimeDelayNotExpired");          break;
+    case 0x70: snprintf(outStr, outLen, "uploadDownloadNotAccepted");            break;
+    case 0x71: snprintf(outStr, outLen, "transferDataSuspended");                break;
+    case 0x72: snprintf(outStr, outLen, "generalProgrammingFailure");            break;
+    case 0x73: snprintf(outStr, outLen, "wrongBlockSequenceCounter");            break;
+    case 0x78: snprintf(outStr, outLen, "requestCorrectlyReceivedResponsePending"); break;
+    case 0x7E: snprintf(outStr, outLen, "subFunctionNotSupportedInActiveSession"); break;
+    case 0x7F: snprintf(outStr, outLen, "serviceNotSupportedInActiveSession");   break;
+    default:   snprintf(outStr, outLen, "unknownNRC_0x%02X", nrc);              break;
+  }
+}

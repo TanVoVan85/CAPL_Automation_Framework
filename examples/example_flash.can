@@ -1,0 +1,267 @@
+/*
+ * example_flash.can
+ * CAPL Automation Framework — CAN Flashing Usage Example
+ *
+ * Demonstrates a complete ECU software update (flash) sequence using the
+ * Flash library.  A synthetic firmware image of 0x1000 bytes is used so
+ * that this example can run without a real binary file.
+ *
+ * The full flash sequence driven here:
+ *   1. Enter Programming Session
+ *   2. Security Access (seed / key)
+ *   3. Erase Memory
+ *   4. Request Download
+ *   5. Transfer Data (loop, 0x200-byte blocks)
+ *   6. Request Transfer Exit
+ *   7. Check Memory
+ *   8. ECU Reset
+ *
+ * Hardware setup assumed:
+ *   Tester — 0x7E0 TX / 0x7E8 RX, CAN channel 1
+ *   ECU    — Programming session accessible at 0x7E8
+ */
+
+includes
+{
+  #include "../lib/Flash/can_flash.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Constants
+ *----------------------------------------------------------------------------*/
+variables
+{
+  const long kTxId          = 0x7E0;
+  const long kRxId          = 0x7E8;
+  const int  kChannel       = 1;
+
+  /* Simulated firmware parameters */
+  const long kFlashAddress  = 0x08000000;  /* Start of application area  */
+  const long kFlashSize     = 0x00001000;  /* 4 KiB synthetic image      */
+  const int  kBlockSize     = 0x200;       /* 512 bytes per block        */
+  const byte kSecLevel      = 0x03;        /* Programming security level */
+
+  /* Fill value for synthetic firmware blocks */
+  const byte kFillByte      = 0xA5;
+
+  /* Byte offsets in a UDS positive response where interesting data starts */
+  const int kSeedOffset     = 2;           /* After SID 0x67 + subFunc   */
+}
+
+/*----------------------------------------------------------------------------
+ * on start
+ *
+ * Configure the flash library and start the flashing sequence.
+ *----------------------------------------------------------------------------*/
+on start
+{
+  logMessage(LOG_INFO, "EXAMPLE_FLASH", "=== CAN Flash Example Started ===");
+
+  /* Configure UDS addressing */
+  gUDS_TxId    = kTxId;
+  gUDS_RxId    = kRxId;
+  gUDS_Channel = kChannel;
+
+  /* Configure flash parameters */
+  gFlash_MemoryAddress = kFlashAddress;
+  gFlash_MemorySize    = kFlashSize;
+  gFlash_BlockSize     = kBlockSize;
+  gFlash_SecurityLevel = kSecLevel;
+
+  /* Start the flash sequence */
+  flash_startSequence();
+}
+
+/*----------------------------------------------------------------------------
+ * on message 0x7E8
+ *
+ * Route all ECU responses through CAN TP and then dispatch to the
+ * appropriate flash state handler.
+ *----------------------------------------------------------------------------*/
+on message 0x7E8
+{
+  byte  frameData[8];
+  byte  respData[UDS_BUFFER_SIZE];
+  int   respLen;
+  int   i;
+  int   state;
+  int   result;
+  byte  seedBytes[8];
+  int   seedLen;
+  char  logMsg[128];
+
+  /* ---- 1. Receive CAN TP frame ----------------------------------------- */
+  for (i = 0; i < 8; i++)
+    frameData[i] = this.byte(i);
+
+  state = canTP_processRxFrame(frameData);
+
+  if (state != CANTP_STATE_COMPLETE)
+    return;   /* Not yet complete — wait for more frames */
+
+  result = canTP_getResponse(respData, elcount(respData));
+  if (result <= 0)
+  {
+    flash_handleError("CAN TP getResponse failed", -result);
+    return;
+  }
+  respLen = result;
+
+  /* ---- 2. UDS-level response processing --------------------------------- */
+  result = uds_processResponse(respData, respLen);
+  if (result == RESULT_NEGATIVE_RESP)
+  {
+    flash_handleError("Negative UDS response received", RESULT_NEGATIVE_RESP);
+    return;
+  }
+
+  /* ---- 3. Dispatch based on flash state --------------------------------- */
+  switch (gFlash_State)
+  {
+    /*-- 3.1 Session established ----------------------------------------*/
+    case FLASH_STATE_SESSION:
+      if (respLen >= 2 && respData[0] == (UDS_SID_SESSION_CTRL | 0x40))
+        flash_onSessionResponse();
+      break;
+
+    /*-- 3.2 Seed received ----------------------------------------------*/
+    case FLASH_STATE_SECURITY_SEED:
+      if (respLen >= 2 && respData[0] == (UDS_SID_SECURITY_ACC | 0x40))
+      {
+        /* Extract seed bytes (skip response SID 0x67 and sub-function) */
+        seedLen = respLen - 2;
+        if (seedLen > 0 && seedLen <= 8)
+        {
+          for (i = 0; i < seedLen; i++)
+            seedBytes[i] = respData[kSeedOffset + i];
+          flash_onSeedResponse(seedBytes, seedLen);
+        }
+        else
+        {
+          flash_handleError("Invalid seed length in response", RESULT_INVALID_PARAM);
+        }
+      }
+      break;
+
+    /*-- 3.3 Key accepted -----------------------------------------------*/
+    case FLASH_STATE_SECURITY_KEY:
+      if (respLen >= 2 && respData[0] == (UDS_SID_SECURITY_ACC | 0x40))
+        flash_onKeyResponse();
+      break;
+
+    /*-- 3.4 Erase complete ---------------------------------------------*/
+    case FLASH_STATE_ERASE:
+      if (respLen >= 1 && respData[0] == (UDS_SID_ROUTINE_CTRL | 0x40))
+        flash_onEraseResponse();
+      break;
+
+    /*-- 3.5 Request Download accepted ----------------------------------*/
+    case FLASH_STATE_REQUEST_DOWNLOAD:
+      if (respLen >= 1 && respData[0] == (UDS_SID_REQ_DOWNLOAD | 0x40))
+      {
+        /* Load the first firmware block before calling onRequestDownloadResponse */
+        example_loadNextBlock();
+        flash_onRequestDownloadResponse();
+      }
+      break;
+
+    /*-- 3.6 Transfer Data block acknowledged ---------------------------*/
+    case FLASH_STATE_TRANSFER_DATA:
+      if (respLen >= 1 && respData[0] == (UDS_SID_TRANSFER_DATA | 0x40))
+      {
+        result = flash_onTransferDataResponse();
+        if (result == RESULT_OK && gFlash_TotalSent < gFlash_MemorySize)
+        {
+          /* Load next block and send it */
+          example_loadNextBlock();
+          flash_sendNextBlock();
+        }
+      }
+      break;
+
+    /*-- 3.7 Transfer Exit acknowledged ---------------------------------*/
+    case FLASH_STATE_TRANSFER_EXIT:
+      if (respLen >= 1 && respData[0] == (UDS_SID_REQ_XFER_EXIT | 0x40))
+        flash_onTransferExitResponse();
+      break;
+
+    /*-- 3.8 Check Memory result ----------------------------------------*/
+    case FLASH_STATE_CHECK_MEMORY:
+      if (respLen >= 1 && respData[0] == (UDS_SID_ROUTINE_CTRL | 0x40))
+        flash_onCheckMemoryResponse();
+      break;
+
+    /*-- 3.9 ECU Reset acknowledged -------------------------------------*/
+    case FLASH_STATE_ECU_RESET:
+      flash_onEcuResetResponse();
+      break;
+
+    default:
+      snprintf(logMsg, elcount(logMsg),
+               "Unexpected response in state 0x%02X", gFlash_State);
+      logMessage(LOG_WARN, "EXAMPLE_FLASH", logMsg);
+      break;
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * example_loadNextBlock
+ *
+ * Fill the flash image buffer with synthetic firmware data.
+ * In a real project replace this with hex-file parsing or memory-mapped I/O.
+ *----------------------------------------------------------------------------*/
+void example_loadNextBlock(void)
+{
+  byte   blockBuf[512];
+  long   remaining;
+  int    blockLen;
+  int    i;
+  char   logMsg[96];
+
+  remaining = gFlash_MemorySize - gFlash_TotalSent;
+  blockLen  = (remaining >= kBlockSize) ? kBlockSize : (int)remaining;
+
+  /* Fill block with synthetic data: offset-based pattern */
+  for (i = 0; i < blockLen; i++)
+    blockBuf[i] = (byte)((gFlash_TotalSent + i) & 0xFF) ^ kFillByte;
+
+  flash_setNextBlock(blockBuf, blockLen);
+
+  snprintf(logMsg, elcount(logMsg),
+           "Loaded block: offset=0x%08lX len=%d", gFlash_TotalSent, blockLen);
+  logMessage(LOG_DEBUG, "EXAMPLE_FLASH", logMsg);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 'f'   — Start flash sequence manually
+ *----------------------------------------------------------------------------*/
+on key 'f'
+{
+  logMessage(LOG_INFO, "EXAMPLE_FLASH", "Manual flash sequence start");
+  flash_startSequence();
+}
+
+/*----------------------------------------------------------------------------
+ * on key 'a'   — Abort / reset flash state
+ *----------------------------------------------------------------------------*/
+on key 'a'
+{
+  logMessage(LOG_WARN, "EXAMPLE_FLASH", "Flash sequence aborted by user");
+  flash_reset();
+  uds_ecuReset(UDS_RESET_HARD);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 's'   — Show current flash state
+ *----------------------------------------------------------------------------*/
+on key 's'
+{
+  char logMsg[128];
+  char resStr[32];
+
+  resultToString(gFlash_LastResult, resStr, elcount(resStr));
+  snprintf(logMsg, elcount(logMsg),
+           "Flash state=0x%02X  lastResult=%s  sent=%ld/%ld",
+           gFlash_State, resStr, gFlash_TotalSent, gFlash_MemorySize);
+  logMessage(LOG_INFO, "EXAMPLE_FLASH", logMsg);
+}

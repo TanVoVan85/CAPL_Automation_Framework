@@ -1,0 +1,195 @@
+/*
+ * example_uds.can
+ * CAPL Automation Framework — UDS Diagnostics Usage Example
+ *
+ * Demonstrates how to use the UDS library to perform common diagnostic
+ * operations: session control, security access, reading and writing data
+ * by identifier, reading DTCs, and running routines.
+ *
+ * Hardware setup assumed:
+ *   Tester — 0x7E0 TX / 0x7E8 RX, CAN channel 1
+ */
+
+includes
+{
+  #include "../lib/UDS/uds_diag.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  const long kTxId    = 0x7E0;
+  const long kRxId    = 0x7E8;
+  const int  kChannel = 1;
+
+  /* DID examples */
+  const word kDID_VIN       = 0xF190;  /* Vehicle Identification Number */
+  const word kDID_ECU_SN    = 0xF18C;  /* ECU Serial Number             */
+
+  /* Security level */
+  const byte kSecurityLevel = 0x01;
+
+  /* Response buffer */
+  byte  gResp[UDS_BUFFER_SIZE];
+  int   gRespLen = 0;
+}
+
+/*----------------------------------------------------------------------------
+ * on start
+ *
+ * Initialise UDS addressing and start a Tester Present timer.
+ *----------------------------------------------------------------------------*/
+on start
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "UDS diagnostics example started");
+
+  /* Configure addressing */
+  gUDS_TxId    = kTxId;
+  gUDS_RxId    = kRxId;
+  gUDS_Channel = kChannel;
+
+  /* Send Tester Present every 2 seconds to keep session alive */
+  uds_startTesterPresent(2000);
+}
+
+/*----------------------------------------------------------------------------
+ * on message 0x7E8
+ *
+ * Route incoming ECU frames through CAN TP, then process as UDS responses.
+ *----------------------------------------------------------------------------*/
+on message 0x7E8
+{
+  byte frameData[8];
+  int  i;
+  int  state;
+  int  result;
+
+  for (i = 0; i < 8; i++)
+    frameData[i] = this.byte(i);
+
+  state = canTP_processRxFrame(frameData);
+
+  if (state == CANTP_STATE_COMPLETE)
+  {
+    result = canTP_getResponse(gResp, elcount(gResp));
+    if (result > 0)
+    {
+      gRespLen = result;
+      uds_processResponse(gResp, gRespLen);
+    }
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * on key '1'   — Enter Default Session
+ *----------------------------------------------------------------------------*/
+on key '1'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Entering Default Diagnostic Session");
+  uds_sessionControl(UDS_SESSION_DEFAULT);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '2'   — Enter Extended Diagnostic Session
+ *----------------------------------------------------------------------------*/
+on key '2'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Entering Extended Diagnostic Session");
+  uds_sessionControl(UDS_SESSION_EXTENDED);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '3'   — Enter Programming Session
+ *----------------------------------------------------------------------------*/
+on key '3'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Entering Programming Session");
+  uds_sessionControl(UDS_SESSION_PROGRAM);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '4'   — Hard ECU Reset
+ *----------------------------------------------------------------------------*/
+on key '4'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Sending Hard ECU Reset");
+  uds_ecuReset(UDS_RESET_HARD);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '5'   — Clear All DTCs
+ *----------------------------------------------------------------------------*/
+on key '5'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Clearing all DTCs");
+  uds_clearDTC(0xFFFFFF);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '6'   — Read DTCs by Status Mask (confirmed + pending)
+ *----------------------------------------------------------------------------*/
+on key '6'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Reading DTCs (confirmed + pending)");
+  uds_readDTCByStatusMask(0x09);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '7'   — Read VIN (DID 0xF190)
+ *----------------------------------------------------------------------------*/
+on key '7'
+{
+  char logMsg[64];
+  snprintf(logMsg, elcount(logMsg), "ReadDataByIdentifier DID=0x%04X (VIN)", kDID_VIN);
+  logMessage(LOG_INFO, "EXAMPLE_UDS", logMsg);
+  uds_readDataByIdentifier(kDID_VIN);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '8'   — Security Access (request seed, level 0x01)
+ *----------------------------------------------------------------------------*/
+on key '8'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Security Access — requesting seed");
+  uds_securityAccessRequestSeed(kSecurityLevel);
+}
+
+/*----------------------------------------------------------------------------
+ * on key '9'   — Routine Control: Start Routine 0xDF00
+ *----------------------------------------------------------------------------*/
+on key '9'
+{
+  byte  params[1];
+  params[0] = 0x00;
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "RoutineControl START 0xDF00");
+  uds_routineControl(UDS_ROUTINE_START, 0xDF00, params, 0);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 't'   — Tester Present (manual, with positive response)
+ *----------------------------------------------------------------------------*/
+on key 't'
+{
+  logMessage(LOG_DEBUG, "EXAMPLE_UDS", "Manual Tester Present");
+  uds_testerPresent(0);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 'x'   — Stop Tester Present timer
+ *----------------------------------------------------------------------------*/
+on key 'x'
+{
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "Stopping Tester Present timer");
+  uds_startTesterPresent(0);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 'r'   — Reset UDS state
+ *----------------------------------------------------------------------------*/
+on key 'r'
+{
+  uds_reset();
+  logMessage(LOG_INFO, "EXAMPLE_UDS", "UDS state reset");
+}
