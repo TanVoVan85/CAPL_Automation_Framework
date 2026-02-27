@@ -1,0 +1,625 @@
+/*
+ * can_flash.can
+ * CAPL Automation Framework — CAN Flashing (ISO 14229-1 + OEM extensions)
+ *
+ * Implements a full ECU software flashing sequence over CAN using UDS services:
+ *
+ *   Step 1  — Enter Programming Session    (SID 0x10 sub 0x02)
+ *   Step 2  — Security Access seed/key     (SID 0x27)
+ *   Step 3  — Erase Memory (Routine 0xFF00) (SID 0x31)
+ *   Step 4  — Request Download              (SID 0x34)
+ *   Step 5  — Transfer Data loop            (SID 0x36)
+ *   Step 6  — Request Transfer Exit         (SID 0x37)
+ *   Step 7  — Check Memory (Routine 0xFF01) (SID 0x31) — optional
+ *   Step 8  — ECU Reset                     (SID 0x11)
+ *
+ * Usage:
+ *   includes { #include "../../lib/Flash/can_flash.can" }
+ *
+ *   Populate gFlash_* configuration variables, call flash_startSequence(),
+ *   and the library drives the state machine automatically.
+ */
+
+includes
+{
+  #include "../UDS/uds_diag.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Constants
+ *----------------------------------------------------------------------------*/
+/* Flash state machine states */
+#define FLASH_STATE_IDLE              0x00
+#define FLASH_STATE_SESSION           0x01
+#define FLASH_STATE_SECURITY_SEED     0x02
+#define FLASH_STATE_SECURITY_KEY      0x03
+#define FLASH_STATE_ERASE             0x04
+#define FLASH_STATE_REQUEST_DOWNLOAD  0x05
+#define FLASH_STATE_TRANSFER_DATA     0x06
+#define FLASH_STATE_TRANSFER_EXIT     0x07
+#define FLASH_STATE_CHECK_MEMORY      0x08
+#define FLASH_STATE_ECU_RESET         0x09
+#define FLASH_STATE_COMPLETE          0x0A
+#define FLASH_STATE_ERROR             0xFF
+
+/* Well-known routine IDs */
+#define FLASH_ROUTINE_ERASE_MEMORY    0xFF00
+#define FLASH_ROUTINE_CHECK_MEMORY    0xFF01
+#define FLASH_ROUTINE_CHECK_PROG_DEP  0xFF02
+
+/* Maximum block size for a single Transfer Data request (bytes) */
+#define FLASH_MAX_BLOCK_SIZE          0xFFD   /* 4093 bytes */
+
+/* Data format identifier for uncompressed / unencrypted data */
+#define FLASH_DATA_FORMAT_ID          0x00
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  /* --- Configuration (set before calling flash_startSequence) ------------- */
+  long  gFlash_MemoryAddress   = 0x00000000; /* Target flash start address   */
+  long  gFlash_MemorySize      = 0x00000000; /* Total bytes to flash          */
+  byte  gFlash_SecurityLevel   = 0x03;       /* Security access level         */
+  int   gFlash_BlockSize       = 0x0200;     /* Max bytes per Transfer Data   */
+  int   gFlash_SkipCheckMemory = 0;          /* 1 = skip Check Memory routine */
+
+  /* --- Firmware image buffer --------------------------------------------- */
+  byte  gFlash_ImageBuf[UDS_BUFFER_SIZE];    /* Current chunk being sent      */
+  int   gFlash_ImageLen        = 0;          /* Bytes in current chunk        */
+  long  gFlash_TotalSent       = 0;          /* Bytes sent so far             */
+  byte  gFlash_BlockSeqCounter = 1;          /* Transfer Data block counter   */
+
+  /* --- Seed / key storage ------------------------------------------------- */
+  byte  gFlash_Seed[8];
+  int   gFlash_SeedLen         = 0;
+  byte  gFlash_Key[8];
+  int   gFlash_KeyLen          = 0;
+
+  /* --- State -------------------------------------------------------------- */
+  int   gFlash_State           = FLASH_STATE_IDLE;
+  int   gFlash_LastResult      = RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_computeKey
+ *
+ * Default seed-to-key algorithm: XOR each seed byte with 0xA5 and complement.
+ *
+ * Replace this function with the OEM-specific algorithm for your project.
+ *
+ * Parameters:
+ *   seed    — seed bytes received from ECU
+ *   seedLen — number of seed bytes
+ *   key     — output: computed key bytes
+ *
+ * Returns the number of key bytes written into key[].
+ *----------------------------------------------------------------------------*/
+int flash_computeKey(byte seed[], int seedLen, byte key[])
+{
+  int i;
+
+  for (i = 0; i < seedLen; i++)
+    key[i] = ~(seed[i] ^ 0xA5);
+
+  return seedLen;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_reset
+ *
+ * Reset the flash state machine.
+ *----------------------------------------------------------------------------*/
+void flash_reset(void)
+{
+  gFlash_State           = FLASH_STATE_IDLE;
+  gFlash_LastResult      = RESULT_OK;
+  gFlash_TotalSent       = 0;
+  gFlash_BlockSeqCounter = 1;
+  gFlash_SeedLen         = 0;
+  gFlash_KeyLen          = 0;
+  uds_reset();
+}
+
+/*----------------------------------------------------------------------------
+ * flash_buildRequestDownload
+ *
+ * Assemble a UDS Request Download (0x34) frame into outBuf[].
+ *
+ * Parameters:
+ *   address — memory address (4 bytes, big-endian)
+ *   size    — memory size    (4 bytes, big-endian)
+ *   outBuf  — output buffer (must be at least 11 bytes)
+ *
+ * Returns the number of bytes written (always 11).
+ *----------------------------------------------------------------------------*/
+int flash_buildRequestDownload(long address, long size, byte outBuf[])
+{
+  /* addressAndLengthFormatIdentifier: high nibble = length bytes, low = addr bytes */
+  byte alfid = 0x44;   /* 4 bytes address, 4 bytes length */
+
+  outBuf[0] = UDS_SID_REQ_DOWNLOAD;
+  outBuf[1] = FLASH_DATA_FORMAT_ID;
+  outBuf[2] = alfid;
+  outBuf[3] = (byte)((address >> 24) & 0xFF);
+  outBuf[4] = (byte)((address >> 16) & 0xFF);
+  outBuf[5] = (byte)((address >>  8) & 0xFF);
+  outBuf[6] = (byte)( address        & 0xFF);
+  outBuf[7] = (byte)((size    >> 24) & 0xFF);
+  outBuf[8] = (byte)((size    >> 16) & 0xFF);
+  outBuf[9] = (byte)((size    >>  8) & 0xFF);
+  outBuf[10]= (byte)( size           & 0xFF);
+
+  return 11;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_buildTransferData
+ *
+ * Assemble a UDS Transfer Data (0x36) frame for one block into outBuf[].
+ *
+ * Parameters:
+ *   blockSeqCounter — rolling counter (1–255, wraps)
+ *   data            — payload bytes for this block
+ *   dataLen         — number of payload bytes
+ *   outBuf          — output buffer (must be at least dataLen + 2 bytes)
+ *
+ * Returns the number of bytes written (dataLen + 2).
+ *----------------------------------------------------------------------------*/
+int flash_buildTransferData(byte blockSeqCounter, byte data[], int dataLen,
+                             byte outBuf[])
+{
+  int i;
+
+  outBuf[0] = UDS_SID_TRANSFER_DATA;
+  outBuf[1] = blockSeqCounter;
+  for (i = 0; i < dataLen; i++)
+    outBuf[2 + i] = data[i];
+
+  return 2 + dataLen;
+}
+
+/*============================================================================
+ * flash_startSequence
+ *
+ * Entry point for a full flash sequence.
+ *
+ * Assumes gFlash_MemoryAddress and gFlash_MemorySize have been configured.
+ * The firmware data must be loaded block by block by the test script before
+ * or during the TRANSFER_DATA phase (see flash_setNextBlock).
+ *============================================================================*/
+int flash_startSequence(void)
+{
+  int result;
+
+  flash_reset();
+
+  logMessage(LOG_INFO, "FLASH", "=== Flash sequence started ===");
+  gFlash_State = FLASH_STATE_SESSION;
+
+  /* Step 1: Enter Programming Session */
+  result = uds_sessionControl(UDS_SESSION_PROGRAM);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send SessionControl", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+    return result;
+  }
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onSessionResponse
+ *
+ * Call when a positive SessionControl response (SID 0x50 0x02) is received.
+ *----------------------------------------------------------------------------*/
+int flash_onSessionResponse(void)
+{
+  int result;
+
+  logMessage(LOG_INFO, "FLASH", "Programming session established");
+  gFlash_State = FLASH_STATE_SECURITY_SEED;
+
+  /* Step 2a: Request Security Seed */
+  result = uds_securityAccessRequestSeed(gFlash_SecurityLevel);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send SecurityAccess seed request", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onSeedResponse
+ *
+ * Call when a positive SecurityAccess seed response (SID 0x67) is received.
+ * Automatically computes the key and sends the SendKey request.
+ *
+ * Parameters:
+ *   seedData — response payload starting after the positive SID
+ *   seedLen  — number of seed bytes
+ *----------------------------------------------------------------------------*/
+int flash_onSeedResponse(byte seedData[], int seedLen)
+{
+  int  result;
+  char logMsg[64];
+
+  if (seedLen <= 0 || seedLen > 8)
+  {
+    logMessage(LOG_ERROR, "FLASH", "Invalid seed length");
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = RESULT_INVALID_PARAM;
+    return RESULT_INVALID_PARAM;
+  }
+
+  memcpy(gFlash_Seed, seedData, seedLen);
+  gFlash_SeedLen = seedLen;
+
+  snprintf(logMsg, elcount(logMsg), "Seed received (%d bytes)", seedLen);
+  logMessage(LOG_DEBUG, "FLASH", logMsg);
+
+  /* Compute key using configured algorithm */
+  gFlash_KeyLen = flash_computeKey(gFlash_Seed, gFlash_SeedLen, gFlash_Key);
+
+  gFlash_State = FLASH_STATE_SECURITY_KEY;
+
+  /* Step 2b: Send computed key */
+  result = uds_securityAccessSendKey(gFlash_SecurityLevel, gFlash_Key, gFlash_KeyLen);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send SecurityAccess key", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onKeyResponse
+ *
+ * Call when a positive SecurityAccess key response (SID 0x67, even level)
+ * is received.
+ *----------------------------------------------------------------------------*/
+int flash_onKeyResponse(void)
+{
+  byte   eraseParams[8];
+  int    result;
+
+  logMessage(LOG_INFO, "FLASH", "Security access unlocked");
+  gFlash_State = FLASH_STATE_ERASE;
+
+  /* Step 3: Erase Memory (Routine 0xFF00) */
+  /* Erase parameters: address (4 bytes) + size (4 bytes) */
+  eraseParams[0] = (byte)((gFlash_MemoryAddress >> 24) & 0xFF);
+  eraseParams[1] = (byte)((gFlash_MemoryAddress >> 16) & 0xFF);
+  eraseParams[2] = (byte)((gFlash_MemoryAddress >>  8) & 0xFF);
+  eraseParams[3] = (byte)( gFlash_MemoryAddress        & 0xFF);
+  eraseParams[4] = (byte)((gFlash_MemorySize    >> 24) & 0xFF);
+  eraseParams[5] = (byte)((gFlash_MemorySize    >> 16) & 0xFF);
+  eraseParams[6] = (byte)((gFlash_MemorySize    >>  8) & 0xFF);
+  eraseParams[7] = (byte)( gFlash_MemorySize           & 0xFF);
+
+  result = uds_routineControl(UDS_ROUTINE_START, FLASH_ROUTINE_ERASE_MEMORY,
+                               eraseParams, 8);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send EraseMemory routine", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onEraseResponse
+ *
+ * Call when a positive RoutineControl response for Erase Memory is received.
+ *----------------------------------------------------------------------------*/
+int flash_onEraseResponse(void)
+{
+  byte reqDownBuf[16];
+  int  reqDownLen;
+  int  result;
+
+  logMessage(LOG_INFO, "FLASH", "Erase complete");
+  gFlash_State = FLASH_STATE_REQUEST_DOWNLOAD;
+
+  /* Step 4: Request Download */
+  reqDownLen = flash_buildRequestDownload(gFlash_MemoryAddress, gFlash_MemorySize,
+                                           reqDownBuf);
+
+  result = uds_sendRequest(reqDownBuf, reqDownLen);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send RequestDownload", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_setNextBlock
+ *
+ * Load the next firmware data block before calling flash_sendNextBlock.
+ *
+ * Parameters:
+ *   data    — firmware bytes for this block
+ *   length  — number of bytes (must be <= gFlash_BlockSize)
+ *
+ * Returns RESULT_OK or RESULT_INVALID_PARAM.
+ *----------------------------------------------------------------------------*/
+int flash_setNextBlock(byte data[], int length)
+{
+  if (length <= 0 || length > FLASH_MAX_BLOCK_SIZE)
+  {
+    logMessage(LOG_ERROR, "FLASH", "Invalid flash block size");
+    return RESULT_INVALID_PARAM;
+  }
+
+  memcpy(gFlash_ImageBuf, data, length);
+  gFlash_ImageLen = length;
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onRequestDownloadResponse
+ *
+ * Call when a positive Request Download response (SID 0x74) is received.
+ * Automatically sends the first Transfer Data block (if one has been loaded).
+ *----------------------------------------------------------------------------*/
+int flash_onRequestDownloadResponse(void)
+{
+  byte  txBuf[UDS_BUFFER_SIZE];
+  int   txLen;
+  int   result;
+  char  logMsg[96];
+
+  logMessage(LOG_INFO, "FLASH", "RequestDownload accepted — starting data transfer");
+  gFlash_State           = FLASH_STATE_TRANSFER_DATA;
+  gFlash_BlockSeqCounter = 1;
+
+  if (gFlash_ImageLen == 0)
+  {
+    logMessage(LOG_WARN, "FLASH",
+               "No data block loaded — call flash_setNextBlock() first");
+    return RESULT_SEQUENCE_ERROR;
+  }
+
+  txLen = flash_buildTransferData(gFlash_BlockSeqCounter, gFlash_ImageBuf, gFlash_ImageLen,
+                                   txBuf);
+
+  snprintf(logMsg, elcount(logMsg),
+           "TransferData block=%d len=%d totalSent=%ld/%ld",
+           gFlash_BlockSeqCounter, gFlash_ImageLen,
+           gFlash_TotalSent + gFlash_ImageLen, gFlash_MemorySize);
+  logMessage(LOG_INFO, "FLASH", logMsg);
+
+  result = uds_sendRequest(txBuf, txLen);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send TransferData", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onTransferDataResponse
+ *
+ * Call when a positive Transfer Data response (SID 0x76) is received.
+ *
+ * If more data remains, loads the next block via the user callback and sends
+ * it.  When all data has been sent, sends Request Transfer Exit.
+ *
+ * To integrate with your test script:
+ *   - Override flash_onNeedNextBlock() to fill the buffer and call
+ *     flash_setNextBlock(), then return RESULT_OK.
+ *   - Return RESULT_OK with length 0 when there is no more data.
+ *----------------------------------------------------------------------------*/
+int flash_onTransferDataResponse(void)
+{
+  byte  txBuf[UDS_BUFFER_SIZE];
+  int   txLen;
+  int   result;
+  char  logMsg[96];
+
+  gFlash_TotalSent       += gFlash_ImageLen;
+  gFlash_BlockSeqCounter  = (gFlash_BlockSeqCounter % 255) + 1;
+  gFlash_ImageLen         = 0;
+
+  snprintf(logMsg, elcount(logMsg),
+           "Block ACK'd — totalSent=%ld/%ld",
+           gFlash_TotalSent, gFlash_MemorySize);
+  logMessage(LOG_INFO, "FLASH", logMsg);
+
+  if (gFlash_TotalSent >= gFlash_MemorySize)
+  {
+    /* Step 6: Request Transfer Exit */
+    byte exitReq[1];
+    exitReq[0] = UDS_SID_REQ_XFER_EXIT;
+    gFlash_State = FLASH_STATE_TRANSFER_EXIT;
+
+    logMessage(LOG_INFO, "FLASH", "All blocks sent — RequestTransferExit");
+    result = uds_sendRequest(exitReq, 1);
+    if (result != RESULT_OK)
+    {
+      logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send RequestTransferExit", result);
+      gFlash_State      = FLASH_STATE_ERROR;
+      gFlash_LastResult = result;
+    }
+    return result;
+  }
+
+  /* More data to send — caller must call flash_setNextBlock then flash_sendNextBlock */
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_sendNextBlock
+ *
+ * Send the block that was loaded by flash_setNextBlock.
+ * Call after flash_onTransferDataResponse returns RESULT_OK and the buffer
+ * has been refilled.
+ *----------------------------------------------------------------------------*/
+int flash_sendNextBlock(void)
+{
+  byte  txBuf[UDS_BUFFER_SIZE];
+  int   txLen;
+  int   result;
+  char  logMsg[96];
+
+  if (gFlash_ImageLen == 0)
+  {
+    logMessage(LOG_WARN, "FLASH", "sendNextBlock called with empty buffer");
+    return RESULT_SEQUENCE_ERROR;
+  }
+
+  txLen = flash_buildTransferData(gFlash_BlockSeqCounter, gFlash_ImageBuf, gFlash_ImageLen,
+                                   txBuf);
+
+  snprintf(logMsg, elcount(logMsg),
+           "TransferData block=%d len=%d totalSent=%ld/%ld",
+           gFlash_BlockSeqCounter, gFlash_ImageLen,
+           gFlash_TotalSent + gFlash_ImageLen, gFlash_MemorySize);
+  logMessage(LOG_INFO, "FLASH", logMsg);
+
+  result = uds_sendRequest(txBuf, txLen);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send TransferData block", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onTransferExitResponse
+ *
+ * Call when a positive Request Transfer Exit response (SID 0x77) is received.
+ *----------------------------------------------------------------------------*/
+int flash_onTransferExitResponse(void)
+{
+  byte  checkParams[1];
+  int   result;
+
+  logMessage(LOG_INFO, "FLASH", "Transfer complete");
+
+  if (gFlash_SkipCheckMemory)
+  {
+    /* Skip to ECU Reset */
+    return flash_doEcuReset();
+  }
+
+  /* Step 7: Check Memory (Routine 0xFF01) */
+  gFlash_State  = FLASH_STATE_CHECK_MEMORY;
+  checkParams[0] = 0x00;  /* No additional parameters */
+
+  result = uds_routineControl(UDS_ROUTINE_START, FLASH_ROUTINE_CHECK_MEMORY,
+                               checkParams, 0);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send CheckMemory routine", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onCheckMemoryResponse
+ *
+ * Call when a positive RoutineControl response for Check Memory is received.
+ *----------------------------------------------------------------------------*/
+int flash_onCheckMemoryResponse(void)
+{
+  logMessage(LOG_INFO, "FLASH", "Memory check passed");
+  return flash_doEcuReset();
+}
+
+/*----------------------------------------------------------------------------
+ * flash_doEcuReset  (internal)
+ *
+ * Step 8: Hard ECU Reset.
+ *----------------------------------------------------------------------------*/
+int flash_doEcuReset(void)
+{
+  int result;
+
+  gFlash_State = FLASH_STATE_ECU_RESET;
+  logMessage(LOG_INFO, "FLASH", "Sending ECU Reset (hard)");
+
+  result = uds_ecuReset(UDS_RESET_HARD);
+  if (result != RESULT_OK)
+  {
+    logMessageWithCode(LOG_ERROR, "FLASH", "Failed to send ECUReset", result);
+    gFlash_State      = FLASH_STATE_ERROR;
+    gFlash_LastResult = result;
+  }
+
+  return result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_onEcuResetResponse
+ *
+ * Call when a positive ECU Reset response (SID 0x51) is received or when
+ * the ECU goes offline (no response expected after reset).
+ *----------------------------------------------------------------------------*/
+void flash_onEcuResetResponse(void)
+{
+  gFlash_State      = FLASH_STATE_COMPLETE;
+  gFlash_LastResult = RESULT_OK;
+  logMessage(LOG_INFO, "FLASH", "=== Flash sequence COMPLETE ===");
+}
+
+/*----------------------------------------------------------------------------
+ * flash_handleError
+ *
+ * Centralised error handler: logs the error and sets state to ERROR.
+ *
+ * Parameters:
+ *   msg    — descriptive message
+ *   result — RESULT_* error code
+ *----------------------------------------------------------------------------*/
+void flash_handleError(char msg[], int result)
+{
+  logMessageWithCode(LOG_ERROR, "FLASH", msg, result);
+  gFlash_State      = FLASH_STATE_ERROR;
+  gFlash_LastResult = result;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_isComplete
+ *
+ * Returns 1 if the flash sequence completed successfully, 0 otherwise.
+ *----------------------------------------------------------------------------*/
+int flash_isComplete(void)
+{
+  return (gFlash_State == FLASH_STATE_COMPLETE) ? 1 : 0;
+}
+
+/*----------------------------------------------------------------------------
+ * flash_hasError
+ *
+ * Returns 1 if the flash sequence is in an error state, 0 otherwise.
+ *----------------------------------------------------------------------------*/
+int flash_hasError(void)
+{
+  return (gFlash_State == FLASH_STATE_ERROR) ? 1 : 0;
+}

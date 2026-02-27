@@ -1,0 +1,561 @@
+/*
+ * can_tp.can
+ * CAPL Automation Framework — CAN Transport Protocol (ISO 15765-2)
+ *
+ * Implements the CAN TP (ISO 15765-2) layer for sending and receiving
+ * multi-frame UDS / diagnostic messages over Classical CAN.
+ *
+ * Frame types:
+ *   Single Frame      (SF)  — PCI[0] bits [7:4] = 0x0,  up to 7 payload bytes
+ *   First Frame       (FF)  — PCI[0] bits [7:4] = 0x1, 12-bit length in PCI
+ *   Consecutive Frame (CF)  — PCI[0] bits [7:4] = 0x2,  SN in bits [3:0]
+ *   Flow Control      (FC)  — PCI[0] bits [7:4] = 0x3
+ *
+ * Usage:
+ *   includes { #include "../../lib/CANTP/can_tp.can" }
+ *
+ * Then call:
+ *   canTP_sendRequest(txId, rxId, data, length, channel)
+ *   canTP_getResponse(outData, maxLen)   — after receiving the response; returns byte count or negative error
+ */
+
+includes
+{
+  #include "../Common/utils.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Constants
+ *----------------------------------------------------------------------------*/
+/* PCI frame type nibbles */
+#define CANTP_PCI_SF   0x00   /* Single Frame      */
+#define CANTP_PCI_FF   0x10   /* First Frame       */
+#define CANTP_PCI_CF   0x20   /* Consecutive Frame */
+#define CANTP_PCI_FC   0x30   /* Flow Control      */
+
+/* Flow Control flag values */
+#define CANTP_FC_CTS   0x00   /* Continue To Send  */
+#define CANTP_FC_WAIT  0x01   /* Wait              */
+#define CANTP_FC_OVFLW 0x02   /* Overflow          */
+
+/* Timing limits (ms) */
+#define CANTP_N_As     25     /* Sender: max time between FF / CF transmissions  */
+#define CANTP_N_Bs     75     /* Sender: max wait for Flow Control               */
+#define CANTP_N_Cs     25     /* Sender: max STmin gap between CFs               */
+#define CANTP_N_Ar     25     /* Receiver: max time to send FC                   */
+#define CANTP_N_Br     75     /* Receiver: processing time before first FC       */
+#define CANTP_N_Cr     150    /* Receiver: max wait between CFs                  */
+
+/* CAN TP state machine states */
+#define CANTP_STATE_IDLE        0x00
+#define CANTP_STATE_TX_FF       0x01
+#define CANTP_STATE_TX_CF       0x02
+#define CANTP_STATE_WAIT_FC     0x03
+#define CANTP_STATE_RX_FF       0x10
+#define CANTP_STATE_RX_CF       0x11
+#define CANTP_STATE_TX_FC       0x12
+#define CANTP_STATE_COMPLETE    0x20
+#define CANTP_STATE_ERROR       0xFF
+
+/* Maximum multi-frame payload size supported by this library (bytes) */
+#define CANTP_MAX_PAYLOAD       4095
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  /* --- Transmit context -------------------------------------------------- */
+  byte  gCANTP_TxBuf[CANTP_MAX_PAYLOAD]; /* Data to transmit               */
+  int   gCANTP_TxLength   = 0;           /* Total bytes to transmit        */
+  int   gCANTP_TxSent     = 0;           /* Bytes transmitted so far       */
+  byte  gCANTP_TxSN       = 0;           /* Consecutive Frame sequence no. */
+  long  gCANTP_TxId       = 0x7E0;       /* Default transmit CAN ID        */
+  int   gCANTP_TxChannel  = 1;           /* CAN channel for TX             */
+
+  /* Flow Control parameters received from remote node */
+  byte  gCANTP_FC_Flag    = CANTP_FC_CTS;
+  byte  gCANTP_FC_BS      = 0;           /* Block Size (0 = unlimited)     */
+  byte  gCANTP_FC_STmin   = 0;           /* Separation Time minimum (ms)   */
+  int   gCANTP_FC_BSCount = 0;           /* Frames sent in current block   */
+
+  /* --- Receive context --------------------------------------------------- */
+  byte  gCANTP_RxBuf[CANTP_MAX_PAYLOAD]; /* Assembled receive buffer       */
+  int   gCANTP_RxLength   = 0;           /* Expected total length          */
+  int   gCANTP_RxReceived = 0;           /* Bytes received so far          */
+  byte  gCANTP_RxSN       = 0;           /* Expected next SN               */
+  long  gCANTP_RxId       = 0x7E8;       /* CAN ID of remote node          */
+
+  /* --- State & timers ---------------------------------------------------- */
+  int   gCANTP_State      = CANTP_STATE_IDLE;
+  msTimer gCANTP_Timer;                  /* Timeout / STmin timer          */
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_reset
+ *
+ * Reset the CAN TP layer to an idle state.
+ *----------------------------------------------------------------------------*/
+void canTP_reset(void)
+{
+  cancelTimer(gCANTP_Timer);
+  gCANTP_State      = CANTP_STATE_IDLE;
+  gCANTP_TxLength   = 0;
+  gCANTP_TxSent     = 0;
+  gCANTP_TxSN       = 0;
+  gCANTP_RxLength   = 0;
+  gCANTP_RxReceived = 0;
+  gCANTP_RxSN       = 0;
+  gCANTP_FC_BSCount = 0;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_buildFrame
+ *
+ * Build a CAN message struct from a raw byte array.
+ * Sets DLC to 8 and pads unused bytes with 0x00.
+ *----------------------------------------------------------------------------*/
+void canTP_buildFrame(message * outMsg, long canId, byte payload[], int payloadLen)
+{
+  int i;
+  outMsg.id  = canId;
+  outMsg.dlc = CAN_MAX_DLC;
+  for (i = 0; i < CAN_MAX_DLC; i++)
+    outMsg.byte(i) = (i < payloadLen) ? payload[i] : 0x00;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_sendSingleFrame
+ *
+ * Transmit a Single Frame (SF) containing up to 7 payload bytes.
+ *
+ * Returns RESULT_OK on success, RESULT_INVALID_PARAM if length > 7.
+ *----------------------------------------------------------------------------*/
+int canTP_sendSingleFrame(long canId, byte data[], int length, int channel)
+{
+  message 0x000 txMsg;
+  byte    frame[CAN_MAX_DLC];
+  char    hexStr[64];
+  char    logMsg[128];
+
+  if (length < 1 || length > 7)
+  {
+    logMessage(LOG_ERROR, "CANTP", "SF length must be 1–7 bytes");
+    return RESULT_INVALID_PARAM;
+  }
+
+  frame[0] = CANTP_PCI_SF | (byte)length;
+  memcpy_off(frame, 1, data, 0, length);
+
+  canTP_buildFrame(txMsg, canId, frame, CAN_MAX_DLC);
+  txMsg.can = channel;
+  output(txMsg);
+
+  bytesToHexString(data, length, hexStr, elcount(hexStr));
+  snprintf(logMsg, elcount(logMsg), "TX SF id=0x%03X len=%d data=[%s]", canId, length, hexStr);
+  logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_sendFirstFrame
+ *
+ * Transmit the First Frame of a multi-frame message.
+ *----------------------------------------------------------------------------*/
+int canTP_sendFirstFrame(long canId, byte data[], int totalLength, int channel)
+{
+  message 0x000 txMsg;
+  byte    frame[CAN_MAX_DLC];
+  char    logMsg[128];
+
+  frame[0] = CANTP_PCI_FF | (byte)((totalLength >> 8) & 0x0F);
+  frame[1] = (byte)(totalLength & 0xFF);
+  memcpy_off(frame, 2, data, 0, 6);
+
+  canTP_buildFrame(txMsg, canId, frame, CAN_MAX_DLC);
+  txMsg.can = channel;
+  output(txMsg);
+
+  snprintf(logMsg, elcount(logMsg), "TX FF id=0x%03X totalLen=%d", canId, totalLength);
+  logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_sendConsecutiveFrame
+ *
+ * Transmit a single Consecutive Frame with the given sequence number (0–15).
+ *----------------------------------------------------------------------------*/
+int canTP_sendConsecutiveFrame(long canId, byte data[], int offset,
+                                int remaining, byte sn, int channel)
+{
+  message 0x000 txMsg;
+  byte    frame[CAN_MAX_DLC];
+  int     bytesInFrame;
+  char    logMsg[128];
+
+  bytesInFrame = (remaining >= 7) ? 7 : remaining;
+
+  frame[0] = CANTP_PCI_CF | (sn & 0x0F);
+  memcpy_off(frame, 1, data, offset, bytesInFrame);
+
+  canTP_buildFrame(txMsg, canId, frame, CAN_MAX_DLC);
+  txMsg.can = channel;
+  output(txMsg);
+
+  snprintf(logMsg, elcount(logMsg), "TX CF id=0x%03X sn=%d offset=%d bytes=%d",
+           canId, sn, offset, bytesInFrame);
+  logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+  return bytesInFrame;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_sendFlowControl
+ *
+ * Transmit a Flow Control frame.
+ *
+ * Parameters:
+ *   canId   — transmit CAN ID
+ *   flag    — CANTP_FC_CTS / CANTP_FC_WAIT / CANTP_FC_OVFLW
+ *   bs      — Block Size (0 = unlimited)
+ *   stMin   — Separation Time minimum (ms, 0–127; 0xF1–0xF9 = 100–900 µs)
+ *   channel — CAN channel number
+ *----------------------------------------------------------------------------*/
+int canTP_sendFlowControl(long canId, byte flag, byte bs, byte stMin, int channel)
+{
+  message 0x000 txMsg;
+  byte    frame[CAN_MAX_DLC];
+  char    logMsg[128];
+
+  frame[0] = CANTP_PCI_FC | (flag & 0x0F);
+  frame[1] = bs;
+  frame[2] = stMin;
+
+  canTP_buildFrame(txMsg, canId, frame, CAN_MAX_DLC);
+  txMsg.can = channel;
+  output(txMsg);
+
+  snprintf(logMsg, elcount(logMsg),
+           "TX FC id=0x%03X flag=%d BS=%d STmin=%d ms", canId, flag, bs, stMin);
+  logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_sendRequest
+ *
+ * High-level API: send a UDS/diagnostic request via CAN TP.
+ *
+ * Parameters:
+ *   txId    — CAN ID used when transmitting frames
+ *   rxId    — CAN ID expected in the response (stored for filtering)
+ *   data    — request payload (without CAN TP header)
+ *   length  — payload length in bytes
+ *   channel — CAN channel number
+ *
+ * Returns RESULT_OK or an error code.
+ *----------------------------------------------------------------------------*/
+int canTP_sendRequest(long txId, long rxId, byte data[], int length, int channel)
+{
+  char logMsg[128];
+  int  result;
+
+  if (length <= 0 || length > CANTP_MAX_PAYLOAD)
+  {
+    logMessage(LOG_ERROR, "CANTP", "Invalid payload length");
+    return RESULT_INVALID_PARAM;
+  }
+
+  /* Store context for multi-frame / response handling */
+  gCANTP_TxId      = txId;
+  gCANTP_RxId      = rxId;
+  gCANTP_TxChannel = channel;
+  gCANTP_TxLength  = length;
+  gCANTP_TxSent    = 0;
+  gCANTP_TxSN      = 1;
+  memcpy(gCANTP_TxBuf, data, length);
+
+  snprintf(logMsg, elcount(logMsg),
+           "sendRequest txId=0x%03X rxId=0x%03X len=%d ch=%d",
+           txId, rxId, length, channel);
+  logMessage(LOG_INFO, "CANTP", logMsg);
+
+  if (length <= 7)
+  {
+    /* Single Frame */
+    result = canTP_sendSingleFrame(txId, data, length, channel);
+    if (result == RESULT_OK)
+      gCANTP_State = CANTP_STATE_COMPLETE;
+    return result;
+  }
+
+  /* Multi-frame: send First Frame then wait for FC */
+  result = canTP_sendFirstFrame(txId, data, length, channel);
+  if (result != RESULT_OK)
+  {
+    gCANTP_State = CANTP_STATE_ERROR;
+    return result;
+  }
+
+  gCANTP_TxSent = 6;  /* 6 bytes carried in the FF */
+  gCANTP_State  = CANTP_STATE_WAIT_FC;
+  setTimer(gCANTP_Timer, CANTP_N_Bs);  /* Start N_Bs timeout */
+
+  return RESULT_OK;
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_processFlowControl
+ *
+ * Parse a received Flow Control frame and continue transmission.
+ * Call this from your on-message handler when you detect a FC frame.
+ *----------------------------------------------------------------------------*/
+void canTP_processFlowControl(byte fcData[])
+{
+  byte flag  = fcData[0] & 0x0F;
+  byte bs    = fcData[1];
+  byte stMin = fcData[2];
+  char logMsg[128];
+  int  bytesSent;
+  int  remaining;
+
+  snprintf(logMsg, elcount(logMsg), "RX FC flag=%d BS=%d STmin=%d ms", flag, bs, stMin);
+  logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+  cancelTimer(gCANTP_Timer);
+
+  if (gCANTP_State != CANTP_STATE_WAIT_FC)
+  {
+    logMessage(LOG_WARN, "CANTP", "Unexpected FC — ignoring");
+    return;
+  }
+
+  switch (flag)
+  {
+    case CANTP_FC_CTS:
+      gCANTP_FC_Flag    = CANTP_FC_CTS;
+      gCANTP_FC_BS      = bs;
+      gCANTP_FC_STmin   = stMin;
+      gCANTP_FC_BSCount = 0;
+      gCANTP_State      = CANTP_STATE_TX_CF;
+
+      /* Send consecutive frames */
+      while (gCANTP_TxSent < gCANTP_TxLength)
+      {
+        remaining  = gCANTP_TxLength - gCANTP_TxSent;
+        bytesSent  = canTP_sendConsecutiveFrame(
+                       gCANTP_TxId, gCANTP_TxBuf, gCANTP_TxSent,
+                       remaining, gCANTP_TxSN, gCANTP_TxChannel);
+        gCANTP_TxSent += bytesSent;
+        gCANTP_TxSN    = (gCANTP_TxSN % 15) + 1;
+        gCANTP_FC_BSCount++;
+
+        /* Block Size limit reached — wait for next FC */
+        if (gCANTP_FC_BS != 0 && gCANTP_FC_BSCount >= gCANTP_FC_BS)
+        {
+          if (gCANTP_TxSent < gCANTP_TxLength)
+          {
+            gCANTP_State = CANTP_STATE_WAIT_FC;
+            setTimer(gCANTP_Timer, CANTP_N_Bs);
+          }
+          break;
+        }
+
+        /* STmin inter-frame delay */
+        if (stMin > 0 && stMin <= 127)
+          waitEx(stMin, 1);
+      }
+
+      if (gCANTP_TxSent >= gCANTP_TxLength)
+      {
+        gCANTP_State = CANTP_STATE_COMPLETE;
+        logMessage(LOG_INFO, "CANTP", "Multi-frame TX complete");
+      }
+      break;
+
+    case CANTP_FC_WAIT:
+      /* Remote is busy — restart N_Bs timeout and wait */
+      logMessage(LOG_DEBUG, "CANTP", "FC WAIT received — holding transmission");
+      setTimer(gCANTP_Timer, CANTP_N_Bs);
+      break;
+
+    case CANTP_FC_OVFLW:
+      logMessage(LOG_ERROR, "CANTP", "FC OVERFLOW received — aborting");
+      gCANTP_State = CANTP_STATE_ERROR;
+      break;
+
+    default:
+      snprintf(logMsg, elcount(logMsg), "Unknown FC flag: 0x%02X", flag);
+      logMessage(LOG_ERROR, "CANTP", logMsg);
+      gCANTP_State = CANTP_STATE_ERROR;
+      break;
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_processRxFrame
+ *
+ * Parse an incoming CAN frame that belongs to a CAN TP session.
+ * Call this from your on-message handler for the expected RX CAN ID.
+ *
+ * Parameters:
+ *   frameData — 8-byte CAN frame payload
+ *
+ * Returns:
+ *   CANTP_STATE_COMPLETE when the full SDU has been assembled,
+ *   CANTP_STATE_RX_CF    while still receiving,
+ *   CANTP_STATE_ERROR    on errors.
+ *----------------------------------------------------------------------------*/
+int canTP_processRxFrame(byte frameData[])
+{
+  byte  pciType;
+  int   sfLen;
+  int   ffLen;
+  byte  cfSN;
+  int   bytesInFrame;
+  int   remaining;
+  char  logMsg[128];
+
+  pciType = frameData[0] & 0xF0;
+
+  switch (pciType)
+  {
+    /*-- Single Frame --------------------------------------------------------*/
+    case (CANTP_PCI_SF & 0xF0):
+      sfLen = frameData[0] & 0x0F;
+      if (sfLen == 0 || sfLen > 7)
+      {
+        logMessage(LOG_ERROR, "CANTP", "Invalid SF length");
+        gCANTP_State = CANTP_STATE_ERROR;
+        return CANTP_STATE_ERROR;
+      }
+      memcpy_off(gCANTP_RxBuf, 0, frameData, 1, sfLen);
+      gCANTP_RxLength   = sfLen;
+      gCANTP_RxReceived = sfLen;
+      gCANTP_State      = CANTP_STATE_COMPLETE;
+
+      snprintf(logMsg, elcount(logMsg), "RX SF len=%d", sfLen);
+      logMessage(LOG_DEBUG, "CANTP", logMsg);
+      return CANTP_STATE_COMPLETE;
+
+    /*-- First Frame ---------------------------------------------------------*/
+    case (CANTP_PCI_FF & 0xF0):
+      ffLen = ((frameData[0] & 0x0F) << 8) | frameData[1];
+      if (ffLen < 8 || ffLen > CANTP_MAX_PAYLOAD)
+      {
+        logMessage(LOG_ERROR, "CANTP", "Invalid FF length");
+        gCANTP_State = CANTP_STATE_ERROR;
+        return CANTP_STATE_ERROR;
+      }
+      gCANTP_RxLength   = ffLen;
+      gCANTP_RxReceived = 6;
+      gCANTP_RxSN       = 1;
+      memcpy_off(gCANTP_RxBuf, 0, frameData, 2, 6);
+      gCANTP_State = CANTP_STATE_RX_CF;
+
+      snprintf(logMsg, elcount(logMsg), "RX FF totalLen=%d", ffLen);
+      logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+      /* Send Flow Control CTS */
+      canTP_sendFlowControl(gCANTP_TxId, CANTP_FC_CTS, 0, 0, gCANTP_TxChannel);
+      setTimer(gCANTP_Timer, CANTP_N_Cr);
+      return CANTP_STATE_RX_CF;
+
+    /*-- Consecutive Frame ---------------------------------------------------*/
+    case (CANTP_PCI_CF & 0xF0):
+      if (gCANTP_State != CANTP_STATE_RX_CF)
+      {
+        logMessage(LOG_WARN, "CANTP", "Unexpected CF — ignoring");
+        return gCANTP_State;
+      }
+
+      cfSN = frameData[0] & 0x0F;
+      if (cfSN != gCANTP_RxSN)
+      {
+        snprintf(logMsg, elcount(logMsg),
+                 "CF SN mismatch: expected %d got %d", gCANTP_RxSN, cfSN);
+        logMessage(LOG_ERROR, "CANTP", logMsg);
+        gCANTP_State = CANTP_STATE_ERROR;
+        return CANTP_STATE_ERROR;
+      }
+
+      cancelTimer(gCANTP_Timer);
+
+      remaining    = gCANTP_RxLength - gCANTP_RxReceived;
+      bytesInFrame = (remaining >= 7) ? 7 : remaining;
+      memcpy_off(gCANTP_RxBuf, gCANTP_RxReceived, frameData, 1, bytesInFrame);
+      gCANTP_RxReceived += bytesInFrame;
+      gCANTP_RxSN = (gCANTP_RxSN % 15) + 1;
+
+      snprintf(logMsg, elcount(logMsg),
+               "RX CF sn=%d received=%d/%d", cfSN, gCANTP_RxReceived, gCANTP_RxLength);
+      logMessage(LOG_DEBUG, "CANTP", logMsg);
+
+      if (gCANTP_RxReceived >= gCANTP_RxLength)
+      {
+        gCANTP_State = CANTP_STATE_COMPLETE;
+        logMessage(LOG_INFO, "CANTP", "Multi-frame RX complete");
+        return CANTP_STATE_COMPLETE;
+      }
+
+      setTimer(gCANTP_Timer, CANTP_N_Cr);
+      return CANTP_STATE_RX_CF;
+
+    /*-- Flow Control (received during send) ---------------------------------*/
+    case (CANTP_PCI_FC & 0xF0):
+      canTP_processFlowControl(frameData);
+      return gCANTP_State;
+
+    default:
+      snprintf(logMsg, elcount(logMsg), "Unknown PCI type: 0x%02X", pciType);
+      logMessage(LOG_ERROR, "CANTP", logMsg);
+      gCANTP_State = CANTP_STATE_ERROR;
+      return CANTP_STATE_ERROR;
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * canTP_getResponse
+ *
+ * Copy the assembled receive buffer into the caller's output array.
+ *
+ * Returns the number of bytes copied on success (>= 1),
+ * RESULT_SEQUENCE_ERROR (negative) if no complete message has been received,
+ * or RESULT_BUFFER_OVERFLOW (negative) when outMaxLen is too small.
+ *
+ * Note: RESULT_* error codes are positive integers; callers must check
+ * for a return value <= 0 to detect errors, or compare against the
+ * specific RESULT_* constants.
+ *----------------------------------------------------------------------------*/
+int canTP_getResponse(byte outData[], int outMaxLen)
+{
+  if (gCANTP_State != CANTP_STATE_COMPLETE)
+  {
+    logMessage(LOG_WARN, "CANTP", "getResponse called but message not complete");
+    return -RESULT_SEQUENCE_ERROR;
+  }
+
+  if (validateBufferLength(outMaxLen, gCANTP_RxReceived, "CANTP") != RESULT_OK)
+    return -RESULT_BUFFER_OVERFLOW;
+
+  memcpy(outData, gCANTP_RxBuf, gCANTP_RxReceived);
+
+  return gCANTP_RxReceived;  /* Number of bytes copied */
+}
+
+/*----------------------------------------------------------------------------
+ * on timer gCANTP_Timer
+ *
+ * CAN TP timeout handler — transitions to error state on expiry.
+ *----------------------------------------------------------------------------*/
+on timer gCANTP_Timer
+{
+  char logMsg[64];
+  snprintf(logMsg, elcount(logMsg), "Timeout in state 0x%02X", gCANTP_State);
+  logMessage(LOG_ERROR, "CANTP", logMsg);
+  gCANTP_State = CANTP_STATE_ERROR;
+}

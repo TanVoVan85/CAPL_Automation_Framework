@@ -1,0 +1,144 @@
+/*
+ * example_can_tp.can
+ * CAPL Automation Framework — CAN TP Usage Example
+ *
+ * Demonstrates single-frame and multi-frame transmit/receive using the
+ * CAN TP library (ISO 15765-2).
+ *
+ * Hardware setup assumed:
+ *   Tester (this node) — CAN ID 0x7E0 (TX) / 0x7E8 (RX), CAN channel 1
+ *   ECU (simulated)    — CAN ID 0x7E8 (TX) / 0x7E0 (RX)
+ */
+
+includes
+{
+  #include "../lib/CANTP/can_tp.can"
+}
+
+/*----------------------------------------------------------------------------
+ * Variables
+ *----------------------------------------------------------------------------*/
+variables
+{
+  /* Tester CAN IDs */
+  const long kTesterTxId = 0x7E0;
+  const long kTesterRxId = 0x7E8;
+  const int  kChannel    = 1;
+
+  /* Sample request data (e.g. a UDS Read DID 0xF190) */
+  byte gSampleRequest[3]  = {0x22, 0xF1, 0x90};
+
+  /* Received response buffer */
+  byte gRespData[4096];
+  int  gRespLen = 0;
+}
+
+/*----------------------------------------------------------------------------
+ * on start
+ *
+ * Initialise CAN TP and send a sample single-frame request.
+ *----------------------------------------------------------------------------*/
+on start
+{
+  int result;
+
+  logMessage(LOG_INFO, "EXAMPLE_CANTP", "CAN TP example started");
+
+  /* Configure CAN TP addressing */
+  gCANTP_TxId     = kTesterTxId;
+  gCANTP_RxId     = kTesterRxId;
+  gCANTP_TxChannel = kChannel;
+
+  /* Send a single-frame request */
+  result = canTP_sendRequest(kTesterTxId, kTesterRxId,
+                              gSampleRequest, elcount(gSampleRequest),
+                              kChannel);
+
+  if (result == RESULT_OK)
+    logMessage(LOG_INFO, "EXAMPLE_CANTP", "Single-frame request sent successfully");
+  else
+    logMessageWithCode(LOG_ERROR, "EXAMPLE_CANTP", "Failed to send request", result);
+}
+
+/*----------------------------------------------------------------------------
+ * on message 0x7E8
+ *
+ * Handle incoming response frames from the ECU.
+ *----------------------------------------------------------------------------*/
+on message 0x7E8
+{
+  byte  frameData[8];
+  int   i;
+  int   state;
+  int   result;
+  char  logMsg[64];
+
+  /* Copy frame bytes into local array */
+  for (i = 0; i < 8; i++)
+    frameData[i] = this.byte(i);
+
+  /* Feed frame to CAN TP state machine */
+  state = canTP_processRxFrame(frameData);
+
+  if (state == CANTP_STATE_COMPLETE)
+  {
+    /* Retrieve assembled payload — returns byte count or negative error code */
+    result = canTP_getResponse(gRespData, elcount(gRespData));
+
+    if (result > 0)
+    {
+      char hexStr[256];
+      gRespLen = result;
+      bytesToHexString(gRespData, gRespLen, hexStr, elcount(hexStr));
+      snprintf(logMsg, elcount(logMsg), "Response assembled (%d bytes): [%s]",
+               gRespLen, hexStr);
+      logMessage(LOG_INFO, "EXAMPLE_CANTP", logMsg);
+    }
+    else
+    {
+      logMessageWithCode(LOG_ERROR, "EXAMPLE_CANTP", "getResponse failed", result);
+    }
+  }
+  else if (state == CANTP_STATE_ERROR)
+  {
+    logMessage(LOG_ERROR, "EXAMPLE_CANTP", "CAN TP error during receive");
+  }
+}
+
+/*----------------------------------------------------------------------------
+ * on key 's'
+ *
+ * Press 's' in the CANoe Write window to send a multi-frame request.
+ *----------------------------------------------------------------------------*/
+on key 's'
+{
+  /* Build a 20-byte payload to trigger multi-frame transmission */
+  byte  longReq[20];
+  int   i;
+  int   result;
+
+  longReq[0] = 0x22;  /* ReadDataByIdentifier — for demonstration only */
+  for (i = 1; i < elcount(longReq); i++)
+    longReq[i] = (byte)i;
+
+  logMessage(LOG_INFO, "EXAMPLE_CANTP", "Sending multi-frame request (20 bytes)");
+
+  result = canTP_sendRequest(kTesterTxId, kTesterRxId,
+                              longReq, elcount(longReq), kChannel);
+
+  if (result == RESULT_OK)
+    logMessage(LOG_INFO, "EXAMPLE_CANTP", "Multi-frame request initiated");
+  else
+    logMessageWithCode(LOG_ERROR, "EXAMPLE_CANTP", "Multi-frame send failed", result);
+}
+
+/*----------------------------------------------------------------------------
+ * on key 'r'
+ *
+ * Press 'r' to reset the CAN TP state machine.
+ *----------------------------------------------------------------------------*/
+on key 'r'
+{
+  canTP_reset();
+  logMessage(LOG_INFO, "EXAMPLE_CANTP", "CAN TP reset");
+}
